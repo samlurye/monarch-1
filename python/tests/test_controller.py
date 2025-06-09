@@ -96,7 +96,7 @@ remote_sleep = remote("time.sleep", propagate="inspect")
     torch.cuda.device_count() < 2,
     reason="Not enough GPUs, this test requires at least 2 GPUs",
 )
-@pytest.mark.parametrize("backend_type", [BackendType.PY, BackendType.RS])
+@pytest.mark.parametrize("backend_type", [BackendType.PY, BackendType.RS, "mesh"])
 # Set global timeout--sandcastle's timeout is 600s. A test that sandcastle times
 # out is not counted as a failure, so we set a more restrictive timeout to
 # ensure we see a hard failure in CI.
@@ -114,7 +114,7 @@ class TestController:
             N,
             gpu_per_host,
             activate,
-            rust=backend_type == BackendType.RS,
+            backend=str(backend_type),
         )
 
     def test_errors(self, backend_type):

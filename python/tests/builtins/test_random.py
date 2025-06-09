@@ -44,7 +44,7 @@ class TestRandomFunctions:
             num_hosts,
             gpu_per_host,
             activate,
-            rust=backend_type == BackendType.RS,
+            backend=str(backend_type),
         )
 
     def test_set_manual_seed_remote(self, backend_type):
