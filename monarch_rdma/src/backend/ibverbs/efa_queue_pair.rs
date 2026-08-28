@@ -673,8 +673,15 @@ impl IbvQueuePair for EfaQueuePair {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv6Addr;
+    use std::time::Duration;
+    use std::time::Instant;
 
     use super::*;
+    use crate::backend::ibverbs::device::IbvDevice;
+    use crate::backend::ibverbs::device::IbvDeviceImpl;
+    use crate::backend::ibverbs::efa_device::EfaDevice;
+    use crate::backend::ibverbs::efa_domain::EfaDomain;
+    use crate::local_memory::KeepaliveLocalMemory;
 
     // A transfer that fits in one work request still gets exactly one, and it
     // is numbered from the id handed in.
@@ -766,5 +773,723 @@ mod tests {
         assert_eq!(attr.grh.traffic_class, 0, "traffic_class is RoCE-only");
         assert_eq!(attr.sl, 0);
         assert_eq!(attr.dlid, 0, "EFA has no LID");
+    }
+
+    // =====================================================================
+    // Shared scaffolding for the EFA hardware probes below.
+    // =====================================================================
+    //
+    // The three probes (same-device two-QP, single-QP loopback, and
+    // cross-node) all open an EFA device, register host buffers, drive SRD
+    // WRITEs, and drain send completions. These helpers hold that common
+    // machinery so each probe reads as just its own experiment.
+
+    /// The probe transfer size, in bytes.
+    const PROBE_LEN: usize = 4096;
+
+    /// A recognizable, position-dependent byte for offset `i`, so a WRITE that
+    /// lands can be verified against the source it came from.
+    fn probe_pattern(i: usize) -> u8 {
+        (i as u8).wrapping_mul(31).wrapping_add(7)
+    }
+
+    /// The outcome of draining one send-queue completion.
+    #[derive(Debug)]
+    enum Outcome {
+        /// A success completion (`IBV_WC_SUCCESS`) for `wr_id`.
+        Success(u64),
+        /// A per-WR failure completion.
+        Failed(WorkRequestError),
+        /// No completion arrived before the deadline.
+        TimedOut,
+        /// `ibv_poll_cq` itself failed; the CQ is unusable.
+        PollBroke(String),
+    }
+
+    impl Outcome {
+        fn is_success(&self) -> bool {
+            matches!(self, Outcome::Success(_))
+        }
+        fn is_failure(&self) -> bool {
+            matches!(self, Outcome::Failed(_))
+        }
+    }
+
+    /// A human-readable name for the `ibv_wc_status` values these probes can
+    /// observe, so a printed verdict is legible without a lookup table.
+    fn wc_status_name(status: rdmaxcel_sys::ibv_wc_status::Type) -> &'static str {
+        use rdmaxcel_sys::ibv_wc_status::*;
+        match status {
+            IBV_WC_SUCCESS => "IBV_WC_SUCCESS",
+            IBV_WC_LOC_LEN_ERR => "IBV_WC_LOC_LEN_ERR",
+            IBV_WC_LOC_QP_OP_ERR => "IBV_WC_LOC_QP_OP_ERR",
+            IBV_WC_LOC_PROT_ERR => "IBV_WC_LOC_PROT_ERR",
+            IBV_WC_WR_FLUSH_ERR => "IBV_WC_WR_FLUSH_ERR",
+            IBV_WC_REM_INV_REQ_ERR => "IBV_WC_REM_INV_REQ_ERR",
+            IBV_WC_REM_ACCESS_ERR => "IBV_WC_REM_ACCESS_ERR",
+            IBV_WC_REM_OP_ERR => "IBV_WC_REM_OP_ERR",
+            IBV_WC_RNR_RETRY_EXC_ERR => "IBV_WC_RNR_RETRY_EXC_ERR",
+            IBV_WC_REM_ABORT_ERR => "IBV_WC_REM_ABORT_ERR",
+            IBV_WC_REM_INV_RD_REQ_ERR => "IBV_WC_REM_INV_RD_REQ_ERR",
+            IBV_WC_BAD_RESP_ERR => "IBV_WC_BAD_RESP_ERR",
+            _ => "IBV_WC_<other>",
+        }
+    }
+
+    fn describe(outcome: &Outcome) -> String {
+        match outcome {
+            Outcome::Success(id) => format!("SUCCESS (wr_id={id}) -- no remote error reported"),
+            Outcome::Failed(err) => format!(
+                "FAILED {} (raw={:?}, vendor_err={}, wr_id={}) -- responder rejected the access",
+                wc_status_name(err.status),
+                err.status,
+                err.vendor_err,
+                err.wr_id,
+            ),
+            Outcome::TimedOut => "TIMED OUT (no completion before the deadline)".to_string(),
+            Outcome::PollBroke(msg) => format!("CQ POLL FAILED: {msg}"),
+        }
+    }
+
+    /// Drain exactly one send-queue completion, waiting up to `timeout`.
+    fn drain_one(qp: &mut EfaQueuePair, timeout: Duration) -> Outcome {
+        let start = Instant::now();
+        loop {
+            match qp.poll_completion(PollTarget::Send) {
+                Ok(Some(Ok(wc))) => return Outcome::Success(wc.wr_id()),
+                Ok(Some(Err(err))) => return Outcome::Failed(err),
+                Ok(None) => {}
+                Err(err) => return Outcome::PollBroke(err.to_string()),
+            }
+            if start.elapsed() >= timeout {
+                return Outcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// Post one RDMA WRITE (`put`) and drain its single send completion.
+    fn write_and_drain(
+        qp: &mut EfaQueuePair,
+        dst: IbvRemoteMemoryRegionView,
+        src: IbvMemoryRegionView,
+        timeout: Duration,
+    ) -> Outcome {
+        qp.put(dst, src)
+            .expect("posting a WRITE should succeed locally");
+        drain_one(qp, timeout)
+    }
+
+    /// Modest SRD config for these probes: small queue depths (the device caps
+    /// are far higher, and `EfaQueuePair::new` rejects a config that exceeds
+    /// them) over host memory (no GPUDirect).
+    fn probe_config() -> IbvConfig {
+        let mut config = IbvConfig::default();
+        EfaDevice::apply_config_defaults(&mut config);
+        config.max_send_wr = 16;
+        config.max_recv_wr = 16;
+        config.use_gpu_direct = false;
+        config
+    }
+
+    /// The name of the first visible EFA device, or `None` when this host lacks
+    /// the verbs stack -- letting a probe self-skip off EFA hardware.
+    fn first_efa_nic() -> Option<String> {
+        IbvDevice::<EfaDevice>::list()
+            .first()
+            .map(|nic| nic.name().clone())
+    }
+
+    /// Create one SRD queue pair on `domain`, with its own modest CQ.
+    fn make_srd_qp(domain: &IbvDomain<EfaDomain>, config: &IbvConfig) -> EfaQueuePair {
+        let cq =
+            Arc::new(unsafe { IbvCq::create(domain.context().clone(), 64) }.expect("create CQ"));
+        domain.create_queue_pair(config, cq).expect("create SRD QP")
+    }
+
+    /// Register a source MR filled with the recognizable probe pattern.
+    ///
+    /// The returned `KeepaliveLocalMemory` must be kept alive for as long as the
+    /// MR is used: the view keeps the *registration* alive, not the backing
+    /// buffer.
+    fn register_pattern_src(
+        domain: &IbvDomain<EfaDomain>,
+    ) -> (KeepaliveLocalMemory, IbvMemoryRegionView) {
+        let data: Box<[u8]> = (0..PROBE_LEN)
+            .map(probe_pattern)
+            .collect::<Vec<u8>>()
+            .into_boxed_slice();
+        let mem = KeepaliveLocalMemory::try_new(Arc::new(data)).expect("wrap source buffer");
+        let view = domain.register_mr(&mem).expect("register source MR");
+        (mem, view)
+    }
+
+    /// Register a zeroed MR sized to the probe pattern. See
+    /// [`register_pattern_src`] on keeping the returned handle alive.
+    fn register_zeroed(
+        domain: &IbvDomain<EfaDomain>,
+    ) -> (KeepaliveLocalMemory, IbvMemoryRegionView) {
+        let mem = KeepaliveLocalMemory::try_new(Arc::new(vec![0u8; PROBE_LEN].into_boxed_slice()))
+            .expect("wrap zeroed buffer");
+        let view = domain.register_mr(&mem).expect("register destination MR");
+        (mem, view)
+    }
+
+    /// A remote view identical to `good` but with an unregistered rkey -- a
+    /// fault only the responder can detect.
+    fn bad_rkey_view(good: &IbvRemoteMemoryRegionView) -> IbvRemoteMemoryRegionView {
+        let bad_rkey = good.rkey ^ 0x00ff_ffff;
+        assert_ne!(bad_rkey, good.rkey, "corrupted rkey must differ");
+        IbvRemoteMemoryRegionView {
+            rkey: bad_rkey,
+            ..good.clone()
+        }
+    }
+
+    /// A remote view identical to `good` but addressing 1 GiB past the region
+    /// -- again detectable only by the responder.
+    fn out_of_bounds_view(good: &IbvRemoteMemoryRegionView) -> IbvRemoteMemoryRegionView {
+        IbvRemoteMemoryRegionView {
+            addr: good.addr + (1usize << 30),
+            ..good.clone()
+        }
+    }
+
+    /// Inject the two responder-only faults against a connected `qp` whose
+    /// valid remote view is `good_dst`: a WRITE with an unregistered rkey, then
+    /// a WRITE to an address outside the region. Print each outcome under
+    /// `label` and return the *decisive* bad-rkey outcome -- only the responder
+    /// can detect either fault, so a failure means the initiator waited for it.
+    fn probe_remote_faults(
+        qp: &mut EfaQueuePair,
+        good_dst: &IbvRemoteMemoryRegionView,
+        src: &IbvMemoryRegionView,
+        timeout: Duration,
+        label: &str,
+    ) -> Outcome {
+        // Decisive probe: WRITE with an unregistered remote rkey.
+        let bad_rkey_outcome = write_and_drain(qp, bad_rkey_view(good_dst), src.clone(), timeout);
+        println!("{label}[2] bad-rkey WRITE: {}", describe(&bad_rkey_outcome));
+
+        // Corroboration: valid rkey, remote address far outside the region.
+        let oob_outcome = write_and_drain(qp, out_of_bounds_view(good_dst), src.clone(), timeout);
+        println!("{label}[3] oob-addr WRITE: {}", describe(&oob_outcome));
+
+        bad_rkey_outcome
+    }
+
+    /// Render the probe verdict from the decisive bad-rkey `outcome` and assert
+    /// it was a *failure* completion -- i.e. the send completion is NOT
+    /// local-only. Kept separate from [`probe_remote_faults`] so a caller can
+    /// release a peer between posting the faults and this (possibly panicking)
+    /// assertion.
+    fn assert_not_local_only(outcome: &Outcome) {
+        let succeeded = outcome.is_success();
+        let failed = outcome.is_failure();
+
+        println!("\n==================== VERDICT ====================");
+        if failed {
+            println!(
+                "EFA SRD send-queue completions are NOT local-only.\n\
+                 A WRITE whose only fault is on the responder surfaced a failure\n\
+                 completion on the initiator, so the completion is generated only\n\
+                 after the remote NIC acknowledges and validates the access, not\n\
+                 when the local NIC accepts the send."
+            );
+        } else if succeeded {
+            println!(
+                "EFA SRD send-queue completions appear LOCAL-ONLY.\n\
+                 A WRITE with an unregistered remote rkey still completed with\n\
+                 success on the initiator."
+            );
+        } else {
+            println!("INCONCLUSIVE (no clear completion for the bad-rkey WRITE).");
+        }
+        println!("=================================================\n");
+
+        assert!(
+            !succeeded,
+            "hypothesis check: the bad-rkey WRITE completed successfully, which \
+             would mean SRD send completions are local-only -- contradicting \
+             rdma-core's REMOTE_ERROR_* completion statuses"
+        );
+        assert!(
+            failed,
+            "expected the bad-rkey WRITE to complete with a failure status \
+             (IBV_WC_REM_ACCESS_ERR), got {outcome:?}"
+        );
+    }
+
+    // =====================================================================
+    // Hardware probe: are EFA SRD send-queue completions local-only?
+    // =====================================================================
+    //
+    // The question: when an SRD queue pair posts a send-queue work request
+    // (here an RDMA WRITE), does a *successful* completion mean only that the
+    // local NIC accepted/transmitted the work, or that the remote NIC
+    // acknowledged it (and, for a WRITE, that the remote memory access
+    // succeeded)?
+    //
+    // The probe: post WRITEs whose only fault is on the responder and see
+    // whether the failure surfaces on the *initiator's* send completion.
+    //   1. a control WRITE that is entirely valid (anchors "success");
+    //   2. a WRITE with an unregistered remote rkey;
+    //   3. a WRITE with a valid rkey but a remote address outside the MR.
+    // Neither fault in (2)/(3) is detectable by the local NIC at post time --
+    // the rkey/IOVA table lives on the responder -- so:
+    //   * if the initiator's completion is SUCCESS  => it is LOCAL-ONLY;
+    //   * if the initiator's completion is an ERROR => the completion waited
+    //     for the responder's acknowledgement (the local NIC could only learn
+    //     the access was rejected from the responder's NAK).
+    //
+    // This is the empirical counterpart to what rdma-core's efa provider
+    // already encodes: `to_ibv_status` (providers/efa/verbs.c) maps the
+    // responder-originated `EFA_IO_COMP_STATUS_REMOTE_ERROR_BAD_ADDRESS`
+    // ("RKEY not registered or does not match remote IOVA") to
+    // `IBV_WC_REM_ACCESS_ERR` on the sender's CQE -- a status the sender can
+    // only produce after a round trip. So the expected verdict is
+    // "NOT local-only", and a bad-rkey WRITE should complete with
+    // `IBV_WC_REM_ACCESS_ERR`.
+    //
+    // Unlike a reliable-connected QP, an SRD QP does *not* enter the error
+    // state when a single WR fails, so ops (2) and (3) are independent rather
+    // than the second being flushed behind the first.
+    //
+    // Self-skips when no EFA device is visible (e.g. a host or container with
+    // no `/dev/infiniband` + `/sys/class/infiniband` verbs stack). Run on an
+    // EFA-provisioned node with:
+    //
+    //   cargo test --lib -p monarch_rdma efa_srd_send_completion_locality -- --nocapture
+    #[test]
+    fn efa_srd_send_completion_locality() {
+        let Some(nic) = first_efa_nic() else {
+            println!(
+                "SKIP efa_srd_send_completion_locality: no EFA device visible \
+                 (ibv_get_device_list returned none). This host/container lacks \
+                 the verbs stack (/dev/infiniband + /sys/class/infiniband); run \
+                 on an EFA-provisioned node, e.g. under `srun`."
+            );
+            return;
+        };
+        println!("Probing EFA device `{nic}` for SRD send-completion locality\n");
+
+        let config = probe_config();
+        let mut device = IbvDevice::<EfaDevice>::try_open(&nic, config.clone())
+            .expect("EFA device from IbvDevice::list should open");
+        let domain = device
+            .get_or_create_domain("srd-locality-probe")
+            .expect("EFA domain creation should succeed");
+
+        // `_src_mem`/`dst_mem` keep the registered buffers mapped for the MRs'
+        // lifetime (a view keeps its registration, not its backing memory);
+        // `dst_mem` is also read back after the control WRITE.
+        let (_src_mem, src_view) = register_pattern_src(domain);
+        let (dst_mem, dst_view) = register_zeroed(domain);
+
+        // Initiator and responder SRD QPs on the same device, cross-connected:
+        // EFA requires the responder to hold a valid address handle back to the
+        // initiator for RDMA ops (otherwise the responder reports
+        // REMOTE_ERROR_UNKNOWN_PEER), so both sides must connect.
+        let mut initiator = make_srd_qp(domain, &config);
+        let mut responder = make_srd_qp(domain, &config);
+        let init_info = initiator.get_qp_info().expect("initiator QP info");
+        let resp_info = responder.get_qp_info().expect("responder QP info");
+        initiator
+            .connect(&resp_info)
+            .expect("connect initiator -> responder");
+        responder
+            .connect(&init_info)
+            .expect("connect responder -> initiator");
+
+        let src = src_view.clone();
+        let good_dst = IbvRemoteMemoryRegionView::from(&dst_view);
+        let timeout = Duration::from_secs(10);
+
+        // 1. Control: a fully valid WRITE must succeed *and* its bytes must
+        //    land at the responder. This ties a success completion to the data
+        //    actually being applied remotely.
+        let control = write_and_drain(&mut initiator, good_dst.clone(), src.clone(), timeout);
+        assert!(
+            control.is_success(),
+            "control WRITE should complete successfully, got {control:?}"
+        );
+        let mut landed = vec![0u8; PROBE_LEN];
+        // SAFETY: `dst_mem` is the sole handle to this host allocation and no
+        // other thread accesses it; the WRITE above has already completed.
+        unsafe { dst_mem.read_at(0, &mut landed) }.expect("read destination");
+        let want: Vec<u8> = (0..PROBE_LEN).map(probe_pattern).collect();
+        assert_eq!(landed, want, "control WRITE did not land at the responder");
+        println!("  [1] control WRITE : SUCCESS, {PROBE_LEN} bytes verified at the responder");
+
+        // 2 & 3. Inject the two responder-only faults, then render the verdict.
+        let bad_rkey = probe_remote_faults(&mut initiator, &good_dst, &src, timeout, "  ");
+        assert_not_local_only(&bad_rkey);
+
+        // Keep the responder alive until every WRITE above has completed: its
+        // QP is the destination QP and holds the address handle the responder
+        // needs to acknowledge the initiator.
+        drop(responder);
+    }
+
+    // =====================================================================
+    // Single-QP loopback: does a self-connected SRD QP work at all?
+    // =====================================================================
+    //
+    // The tightest possible local configuration: a *single* SRD QP connected
+    // to itself, so it is simultaneously the initiator and the responder and
+    // every WRITE loops back through one NIC into memory the same QP owns.
+    // `efa_srd_send_completion_locality` uses two cross-connected QPs on one
+    // device; this collapses that to one self-connected QP.
+    //
+    // This is only a liveness check -- it proves the loopback path carries data
+    // end to end: a valid WRITE completes and its bytes land in the destination
+    // buffer. It deliberately does *not* inject the responder-only faults; the
+    // send-completion locality question is answered by
+    // `efa_srd_send_completion_locality` (same device) and
+    // `efa_srd_send_completion_locality_xnode` (across the fabric).
+    //
+    // Self-skips when no EFA device is visible. Run on an EFA-provisioned node
+    // with:
+    //
+    //   cargo test --lib -p monarch_rdma efa_srd_send_completion_locality_loopback -- --nocapture
+    #[test]
+    fn efa_srd_send_completion_locality_loopback() {
+        let Some(nic) = first_efa_nic() else {
+            println!(
+                "SKIP efa_srd_send_completion_locality_loopback: no EFA device visible \
+                 (ibv_get_device_list returned none). This host/container lacks the \
+                 verbs stack (/dev/infiniband + /sys/class/infiniband); run on an \
+                 EFA-provisioned node, e.g. under `srun`."
+            );
+            return;
+        };
+        println!("Exercising a single-QP loopback WRITE on EFA device `{nic}`\n");
+
+        let config = probe_config();
+        let mut device = IbvDevice::<EfaDevice>::try_open(&nic, config.clone())
+            .expect("EFA device from IbvDevice::list should open");
+        let domain = device
+            .get_or_create_domain("srd-loopback")
+            .expect("EFA domain creation should succeed");
+
+        // `_src_mem`/`dst_mem` keep the registered buffers mapped for the MRs'
+        // lifetime; `dst_mem` is read back to confirm the bytes looped through.
+        let (_src_mem, src_view) = register_pattern_src(domain);
+        let (dst_mem, dst_view) = register_zeroed(domain);
+
+        // One SRD QP connected to itself: it is both initiator and responder,
+        // so a WRITE loops back through this NIC into memory the same QP owns.
+        // EFA still requires a valid address handle back to the "peer" for RDMA
+        // ops; here the peer is us, so we connect to our own QP info (otherwise
+        // the responder side reports REMOTE_ERROR_UNKNOWN_PEER).
+        let mut qp = make_srd_qp(domain, &config);
+        let my_info = qp.get_qp_info().expect("loopback QP info");
+        qp.connect(&my_info).expect("connect loopback QP to itself");
+
+        let src = src_view.clone();
+        let good_dst = IbvRemoteMemoryRegionView::from(&dst_view);
+        let timeout = Duration::from_secs(10);
+
+        // A single valid WRITE must complete successfully and its bytes must
+        // land in the destination buffer -- proving the loopback path carries
+        // data end to end through one self-connected QP. (This is only a
+        // liveness check; the responder-only fault probes that decide the
+        // locality question live in `efa_srd_send_completion_locality`.)
+        let control = write_and_drain(&mut qp, good_dst, src, timeout);
+        assert!(
+            control.is_success(),
+            "loopback WRITE should complete successfully, got {control:?}"
+        );
+        let mut landed = vec![0u8; PROBE_LEN];
+        // SAFETY: `dst_mem` is the sole handle to this host allocation and no
+        // other thread accesses it; the WRITE above has already completed.
+        unsafe { dst_mem.read_at(0, &mut landed) }.expect("read destination");
+        let want: Vec<u8> = (0..PROBE_LEN).map(probe_pattern).collect();
+        assert_eq!(
+            landed, want,
+            "loopback WRITE did not land in the destination buffer"
+        );
+        println!("  loopback WRITE: SUCCESS, {PROBE_LEN} bytes verified via a self-connected QP");
+    }
+
+    // =====================================================================
+    // Cross-node variant of the locality probe.
+    // =====================================================================
+    //
+    // Same question as `efa_srd_send_completion_locality`, but the initiator
+    // and responder run in *separate processes on separate nodes*, so every
+    // WRITE crosses the real EFA fabric between two hosts instead of looping
+    // back through one NIC. That rules out any same-NIC shortcut: a
+    // remote-only fault (bad rkey / out-of-bounds remote address) that still
+    // surfaces on the initiator's completion proves the completion waited for
+    // the *other host's* NIC to acknowledge (and validate) the access.
+    //
+    // The fault injection has to live at this `EfaQueuePair` /
+    // `IbvRemoteMemoryRegionView` layer -- the high-level Python `RDMABuffer`
+    // API never exposes an rkey to
+    // corrupt -- so the data path is this Rust test on both nodes. Only the
+    // launch is external: run this same test binary as two tasks (one per
+    // node), e.g. under `srun -N2 --ntasks-per-node=1`. The two ranks find
+    // each other through a shared-filesystem rendezvous directory, over which
+    // they exchange QP endpoint info and the destination buffer as JSON.
+    //
+    // Role comes from `EFA_PROBE_ROLE` (`responder`|`initiator`), or from
+    // `SLURM_PROCID` (0 => responder) when that is unset. The rendezvous
+    // directory comes from `EFA_PROBE_RENDEZVOUS`. The test self-skips when no
+    // role is set, so an ordinary `cargo test` never runs it.
+    //
+    //   # Build once on the shared filesystem, then run one task per node:
+    //   cargo test --lib -p monarch_rdma efa_srd_send_completion_locality_xnode --no-run
+    //   # (note the "Executable ... (target/debug/deps/monarch_rdma-<hash>)" path)
+    //   RDVZ="$HOME/efa_probe_rdvz.$SLURM_JOB_ID"   # fresh, empty, on shared FS
+    //   srun -N2 --ntasks-per-node=1 --gpus-per-node=1 -p <efa-partition> \
+    //     env EFA_PROBE_RENDEZVOUS="$RDVZ" \
+    //     target/debug/deps/monarch_rdma-<hash> \
+    //       --exact backend::ibverbs::efa_queue_pair::tests::efa_srd_send_completion_locality_xnode \
+    //       --nocapture --test-threads=1
+    #[test]
+    fn efa_srd_send_completion_locality_xnode() {
+        use std::path::Path;
+        use std::path::PathBuf;
+
+        // The responder's advertised endpoint: its QP address plus the
+        // destination buffer's keys/address. Both derive serde, so the raw
+        // fields (GID bytes included) cross the filesystem without hand
+        // encoding anything private.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Endpoint {
+            qp: IbvQpInfo,
+            buf: IbvRemoteMemoryRegionView,
+        }
+
+        // Atomically publish `value` at `path` (write-then-rename), so a reader
+        // on the other node never observes a half-written file.
+        fn publish<T: serde::Serialize>(path: &Path, value: &T) {
+            let tmp = path.with_extension("tmp");
+            std::fs::write(
+                &tmp,
+                serde_json::to_vec(value).expect("serialize rendezvous payload"),
+            )
+            .expect("write rendezvous tmp file");
+            std::fs::rename(&tmp, path).expect("atomically publish rendezvous file");
+        }
+
+        // Poll for a rendezvous file to appear and deserialize it.
+        fn await_json<T: serde::de::DeserializeOwned>(path: &Path, timeout: Duration) -> T {
+            let start = Instant::now();
+            loop {
+                if let Ok(bytes) = std::fs::read(path)
+                    && !bytes.is_empty()
+                    && let Ok(value) = serde_json::from_slice::<T>(&bytes)
+                {
+                    return value;
+                }
+                assert!(
+                    start.elapsed() < timeout,
+                    "timed out after {timeout:?} waiting for {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn await_flag(path: &Path, timeout: Duration) {
+            let start = Instant::now();
+            while !path.exists() {
+                assert!(
+                    start.elapsed() < timeout,
+                    "timed out after {timeout:?} waiting for flag {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum Role {
+            Responder,
+            Initiator,
+        }
+
+        // Role from EFA_PROBE_ROLE, else from SLURM_PROCID (rank 0 = responder).
+        let role = match std::env::var("EFA_PROBE_ROLE").ok().as_deref() {
+            Some("responder") => Some(Role::Responder),
+            Some("initiator") => Some(Role::Initiator),
+            Some(other) => {
+                panic!("EFA_PROBE_ROLE must be 'responder' or 'initiator', got {other:?}")
+            }
+            None => std::env::var("SLURM_PROCID")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .map(|procid| {
+                    if procid == 0 {
+                        Role::Responder
+                    } else {
+                        Role::Initiator
+                    }
+                }),
+        };
+        let Some(role) = role else {
+            println!(
+                "SKIP efa_srd_send_completion_locality_xnode: set EFA_PROBE_ROLE=responder|initiator \
+                 (or launch under srun so SLURM_PROCID is set) plus EFA_PROBE_RENDEZVOUS=<shared dir> \
+                 to activate this cross-node probe."
+            );
+            return;
+        };
+        let rdvz =
+            PathBuf::from(std::env::var("EFA_PROBE_RENDEZVOUS").expect(
+                "EFA_PROBE_RENDEZVOUS must name a shared-filesystem dir both nodes can see",
+            ));
+        std::fs::create_dir_all(&rdvz).expect("create rendezvous directory");
+
+        let host = std::env::var("SLURMD_NODENAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "?".to_string());
+        let role_str = match role {
+            Role::Responder => "responder",
+            Role::Initiator => "initiator",
+        };
+
+        let Some(nic) = first_efa_nic() else {
+            println!(
+                "SKIP efa_srd_send_completion_locality_xnode [{role_str}@{host}]: no EFA device \
+                 visible (no /dev/infiniband verbs stack on this node)."
+            );
+            return;
+        };
+        println!(
+            "[{role_str}@{host}] cross-node SRD probe on `{nic}`, rendezvous={}",
+            rdvz.display()
+        );
+
+        let config = probe_config();
+        let mut device = IbvDevice::<EfaDevice>::try_open(&nic, config.clone())
+            .expect("EFA device from IbvDevice::list should open");
+        let domain = device
+            .get_or_create_domain("srd-xnode-probe")
+            .expect("EFA domain creation should succeed");
+
+        let timeout = Duration::from_secs(120);
+
+        let responder_ep = rdvz.join("responder.json");
+        let initiator_ep = rdvz.join("initiator.json");
+        let responder_ready = rdvz.join("responder_ready.flag");
+        let done = rdvz.join("done.flag");
+
+        match role {
+            Role::Responder => {
+                // Tolerate a reused directory: clear the files this side owns
+                // (and the initiator's done-signal) before republishing.
+                for stale in [&responder_ep, &responder_ready, &done] {
+                    let _ = std::fs::remove_file(stale);
+                }
+
+                let (dst_mem, dst_view) = register_zeroed(domain);
+                let mut qp = make_srd_qp(domain, &config);
+                let my_info = qp.get_qp_info().expect("responder QP info");
+                publish(
+                    &responder_ep,
+                    &Endpoint {
+                        qp: my_info,
+                        buf: IbvRemoteMemoryRegionView::from(&dst_view),
+                    },
+                );
+                println!("[{role_str}@{host}] published endpoint; awaiting initiator");
+                let init_info: IbvQpInfo = await_json(&initiator_ep, timeout);
+                qp.connect(&init_info)
+                    .expect("connect responder -> initiator");
+                // Signal that our QP now holds an address handle back to the
+                // initiator, so its first WRITE isn't rejected as UNKNOWN_PEER.
+                publish(&responder_ready, &"ready");
+                println!(
+                    "[{role_str}@{host}] connected; holding QP/MR open until the initiator finishes"
+                );
+                await_flag(&done, timeout);
+
+                // Cross-check from the far side: the control WRITE's bytes
+                // should be present in our memory; the bad-rkey and OOB WRITEs
+                // targeted an invalid key/address and must not have landed.
+                let mut landed = vec![0u8; PROBE_LEN];
+                // SAFETY: sole handle to this host allocation; the initiator has
+                // signalled it is done, so no WRITE is still in flight.
+                unsafe { dst_mem.read_at(0, &mut landed) }.expect("read destination");
+                let want: Vec<u8> = (0..PROBE_LEN).map(probe_pattern).collect();
+                if landed == want {
+                    println!("[{role_str}@{host}] control-WRITE bytes present in local memory: OK");
+                } else {
+                    println!(
+                        "[{role_str}@{host}] NOTE: destination did not match the control pattern at \
+                         read time (unexpected)."
+                    );
+                }
+                println!("[{role_str}@{host}] done.");
+            }
+            Role::Initiator => {
+                let _ = std::fs::remove_file(&initiator_ep);
+
+                let (_src_mem, src_view) = register_pattern_src(domain);
+                // A local buffer to READ the remote back into, to prove the
+                // control WRITE actually landed on the *other* host.
+                let (readback_mem, readback_view) = register_zeroed(domain);
+                let mut qp = make_srd_qp(domain, &config);
+                let my_info = qp.get_qp_info().expect("initiator QP info");
+
+                println!("[{role_str}@{host}] awaiting responder endpoint");
+                let remote: Endpoint = await_json(&responder_ep, timeout);
+                publish(&initiator_ep, &my_info);
+                qp.connect(&remote.qp)
+                    .expect("connect initiator -> responder");
+                await_flag(&responder_ready, timeout);
+                println!(
+                    "[{role_str}@{host}] connected to responder; issuing WRITEs across the fabric"
+                );
+
+                let src = src_view.clone();
+                let good_dst = remote.buf; // the responder's buffer, on the other host
+
+                // 1. Control WRITE, then an RDMA READ-back of the remote buffer:
+                //    a success completion whose bytes we can read back from the
+                //    other host anchors what "success" means across nodes.
+                let control = write_and_drain(&mut qp, good_dst.clone(), src.clone(), timeout);
+                assert!(
+                    control.is_success(),
+                    "control WRITE should succeed, got {control:?}"
+                );
+                qp.get(readback_view.clone(), good_dst.clone())
+                    .expect("post readback READ");
+                let readback = drain_one(&mut qp, timeout);
+                assert!(
+                    readback.is_success(),
+                    "readback READ should succeed, got {readback:?}"
+                );
+                let mut got = vec![0u8; PROBE_LEN];
+                // SAFETY: sole handle to this host allocation; the READ above
+                // has completed, so nothing is still writing into it.
+                unsafe { readback_mem.read_at(0, &mut got) }.expect("read readback buffer");
+                let want: Vec<u8> = (0..PROBE_LEN).map(probe_pattern).collect();
+                assert_eq!(got, want, "control WRITE did not land on the remote host");
+                println!(
+                    "[{role_str}@{host}] [1] control WRITE + readback READ across nodes: {PROBE_LEN} bytes \
+                     verified on the remote host"
+                );
+
+                // 2 & 3. Inject the responder-only faults across the fabric.
+                let bad_rkey = probe_remote_faults(
+                    &mut qp,
+                    &good_dst,
+                    &src,
+                    timeout,
+                    &format!("[{role_str}@{host}] "),
+                );
+
+                // Release the responder now that every WRITE has completed,
+                // before the (possibly panicking) verdict assertion -- so a
+                // failed hypothesis check doesn't strand it waiting on `done`.
+                publish(&done, &"done");
+
+                assert_not_local_only(&bad_rkey);
+            }
+        }
     }
 }

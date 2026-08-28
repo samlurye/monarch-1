@@ -20,6 +20,11 @@ hyperactor_config = { version = "0.0.0", path = "../hyperactor_config" }
 hyperactor_mesh = { version = "0.0.0", path = "../hyperactor_mesh" }
 inventory = "0.3.24"
 libc = "0.2.186"
+# Not used from Rust; the normal-dependency edge is what exposes
+# monarch_cpp_static_libs's `DEP_*` metadata (rdma-core include dir + static
+# archive paths) to this crate's build.rs, which re-emits the link args so
+# `monarch_rdma`'s own test binaries link libibverbs/libmlx5/libefa.
+monarch_cpp_static_libs = { version = "0.0.0", path = "../monarch_cpp_static_libs" }
 ndslice = { version = "0.0.0", path = "../ndslice" }
 paste = "1.0.14"
 rand = "0.10.2"
@@ -32,7 +37,12 @@ tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 typeuri = { version = "0.0.0", path = "../typeuri" }
 wirevalue = { version = "0.0.0", path = "../wirevalue" }
 
+[build-dependencies]
+build_utils = { version = "0.0.0", path = "../build_utils" }
+monarch_cpp_static_libs = { version = "0.0.0", path = "../monarch_cpp_static_libs" }
+
 [dev-dependencies]
+serde_json = "1.0.151"
 timed_test = { version = "0.0.0", path = "../timed_test" }
 
 [features]
